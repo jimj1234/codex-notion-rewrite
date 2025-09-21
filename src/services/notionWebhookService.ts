@@ -96,43 +96,137 @@ const gatherPageContext = async (pageId: string) => {
 const getCommentText = (comment: CommentObjectResponse): string =>
   (comment.rich_text ?? []).map((rt: RichTextItemResponse) => rt.plain_text).join(' ');
 
-export const handleNotionWebhook = async (payload: NotionWebhookBody): Promise<void> => {
-  if (payload.payload.type !== 'event_callback') {
+const unique = <T>(arr: T[]): T[] => Array.from(new Set(arr));
+
+const extractCandidateCommentIds = (payload: Record<string, any>): string[] => {
+  const candidates: (string | undefined)[] = [];
+  const p = payload as any;
+  // Common locations
+  candidates.push(p?.payload?.data?.comment?.id);
+  candidates.push(p?.payload?.data?.id);
+  candidates.push(p?.data?.comment?.id);
+  candidates.push(p?.data?.id);
+  // Event array shapes
+  const evtArr: any[] = Array.isArray(p?.payload?.events)
+    ? p.payload.events
+    : Array.isArray(p?.events)
+    ? p.events
+    : p?.event
+    ? [p.event]
+    : [];
+  for (const e of evtArr) {
+    const d = e?.data;
+    candidates.push(d?.comment?.id);
+    candidates.push(d?.id);
+  }
+  return unique(candidates.filter((v): v is string => typeof v === 'string' && v.length > 0));
+};
+
+export const handleNotionWebhook = async (body: NotionWebhookBody | Record<string, any>): Promise<void> => {
+  const envelope: any = (body as any)?.payload ?? body;
+  if (!envelope || typeof envelope !== 'object') {
     return;
   }
 
-  const relevantEvents = payload.payload.events.filter((event) => event.type === 'comment');
+  // Support both envelope.type === 'event_callback' and single-event envelopes (e.g., 'comment.created')
 
-  for (const event of relevantEvents) {
-    const commentId = (event.data as { id?: string }).id;
-    if (!commentId) {
-      continue;
+  let eventsArray: any[] = Array.isArray(envelope.events)
+    ? envelope.events
+    : envelope.event
+    ? [envelope.event]
+    : [];
+
+  // Some Notion payloads may provide a single event via type+data only
+  if ((!Array.isArray(eventsArray) || eventsArray.length === 0) && typeof envelope.type === 'string' && envelope.data) {
+    eventsArray = [{ type: envelope.type, data: envelope.data }];
+  }
+
+  if (!Array.isArray(eventsArray) || eventsArray.length === 0) {
+    return;
+  }
+
+  // Drop any falsy/invalid entries to avoid accessing undefined.type
+  eventsArray = eventsArray.filter((e: any) => e && typeof e === 'object' && typeof e.type === 'string');
+
+  // Notion may send event types like "comment", "comment.created", etc.
+  const relevantEvents = eventsArray.filter((event) => {
+    const t = typeof (event && (event as any).type) === 'string' ? String((event as any).type).toLowerCase() : '';
+    return t.includes('comment');
+  });
+
+  // If events did not include a comment type, still try to extract a comment id from the whole payload
+  const fallbackCandidates = relevantEvents.length === 0 ? extractCandidateCommentIds(body as any) : [];
+
+  for (const event of relevantEvents.length ? relevantEvents : fallbackCandidates) {
+    try {
+      let commentId: string | undefined;
+      if (typeof event === 'string') {
+        commentId = event;
+      } else {
+        const data = (event && typeof event === 'object' ? (event as any).data : undefined) as
+          | Record<string, any>
+          | undefined;
+        commentId =
+          data?.id ||
+          data?.comment?.id ||
+          data?.comment_id ||
+          (body as any)?.payload?.data?.comment?.id ||
+          (body as any)?.entity?.id;
+      }
+      if (!commentId) {
+        continue;
+      }
+
+      let comment: CommentObjectResponse | null = null;
+      try {
+        comment = (await notionClient.comments.retrieve({ comment_id: commentId })) as CommentObjectResponse;
+      } catch (err) {
+        // Try other candidates if this id is not a valid comment id
+        if (relevantEvents.length === 0) {
+          const more = extractCandidateCommentIds(body as any).filter((id) => id !== commentId);
+          for (const alt of more) {
+            try {
+              comment = (await notionClient.comments.retrieve({ comment_id: alt })) as CommentObjectResponse;
+              commentId = alt;
+              break;
+            } catch (_) {
+              // keep trying
+            }
+          }
+        }
+        if (!comment) {
+          continue;
+        }
+      }
+      const commentText = getCommentText(comment);
+
+      if (!hasTriggerKeyword(commentText)) {
+        continue;
+      }
+
+      const instructionOverride = stripTriggerKeyword(commentText);
+      const pageIdFromPayload: string | undefined =
+        (body as any)?.payload?.data?.page_id || (body as any)?.data?.page_id;
+      const targetPageId = pageIdFromPayload || (await resolvePageIdFromParent(comment.parent));
+
+      if (!targetPageId) {
+        console.warn(`Unable to resolve page for comment ${commentId}`);
+        continue;
+      }
+
+      const { pageTitle, pageMarkdown, rootBlockIds } = await gatherPageContext(targetPageId);
+      const rewriteContext = {
+        pageId: targetPageId,
+        pageTitle,
+        pageMarkdown,
+        rootBlockIds,
+        ...(instructionOverride.length ? { overrideInstructions: instructionOverride } : {}),
+      };
+
+      await rewritePage(rewriteContext);
+    } catch (err) {
+      console.error('Failed to process comment event', err);
+      // continue with other events
     }
-
-    const comment = (await notionClient.comments.retrieve({ comment_id: commentId })) as CommentObjectResponse;
-    const commentText = getCommentText(comment);
-
-    if (!hasTriggerKeyword(commentText)) {
-      continue;
-    }
-
-    const instructionOverride = stripTriggerKeyword(commentText);
-    const targetPageId = await resolvePageIdFromParent(comment.parent);
-
-    if (!targetPageId) {
-      console.warn(`Unable to resolve page for comment ${commentId}`);
-      continue;
-    }
-
-    const { pageTitle, pageMarkdown, rootBlockIds } = await gatherPageContext(targetPageId);
-    const rewriteContext = {
-      pageId: targetPageId,
-      pageTitle,
-      pageMarkdown,
-      rootBlockIds,
-      ...(instructionOverride.length ? { overrideInstructions: instructionOverride } : {}),
-    };
-
-    await rewritePage(rewriteContext);
   }
 };
