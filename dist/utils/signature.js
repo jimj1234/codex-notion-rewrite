@@ -10,6 +10,10 @@ exports.notionHeaders = {
     timestamp: TIMESTAMP_HEADER,
 };
 const verifyNotionSignature = (rawBody, signature, timestamp) => {
+    // If no signing secret configured, accept the request (internal webhook without signatures)
+    if (!env_1.env.NOTION_WEBHOOK_SECRET) {
+        return true;
+    }
     if (!signature || !timestamp) {
         return false;
     }

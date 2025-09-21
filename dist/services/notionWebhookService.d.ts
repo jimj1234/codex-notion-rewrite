@@ -12,6 +12,6 @@ interface NotionWebhookBody {
         events: NotionWebhookEvent[];
     };
 }
-export declare const handleNotionWebhook: (payload: NotionWebhookBody) => Promise<void>;
+export declare const handleNotionWebhook: (body: NotionWebhookBody | Record<string, any>) => Promise<void>;
 export {};
 //# sourceMappingURL=notionWebhookService.d.ts.map

@@ -5,6 +5,7 @@ const notion_1 = require("../clients/notion");
 const openrouter_1 = require("../clients/openrouter");
 const blockSpec_1 = require("../utils/blockSpec");
 const env_1 = require("../config/env");
+const notionBlocks_1 = require("../utils/notionBlocks");
 const DEFAULT_SYSTEM_PROMPT = `You are an elite knowledge architect assisting with reorganizing Notion documentation.
 - Preserve all factual information while dramatically improving readability.
 - Start the page with a concise orientation (summary or key outcomes).
@@ -51,8 +52,11 @@ const chunk = (items, size) => {
     }
     return chunks;
 };
-const deleteExistingBlocks = async (blockIds) => {
+const deleteExistingBlocks = async (blockIds, skipIds = new Set()) => {
     for (const id of blockIds) {
+        if (skipIds.has(id)) {
+            continue;
+        }
         await notion_1.notionClient.blocks.delete({ block_id: id });
     }
 };
@@ -104,8 +108,15 @@ const rewritePage = async (context) => {
     if (blockRequests.length === 0) {
         throw new Error('LLM returned no blocks; aborting rewrite to avoid wiping the page.');
     }
-    await deleteExistingBlocks(context.rootBlockIds);
     await appendBlocks(context.pageId, blockRequests);
+    const currentRootBlocks = await (0, notionBlocks_1.fetchBlockChildren)(context.pageId);
+    const initialRootIds = new Set(context.rootBlockIds);
+    const currentRootIds = currentRootBlocks.map((block) => block.id);
+    const newRootIds = currentRootIds.filter((id) => !initialRootIds.has(id));
+    if (newRootIds.length === 0) {
+        throw new Error('Appended blocks not detected; aborting deletion to preserve page content.');
+    }
+    await deleteExistingBlocks(context.rootBlockIds, new Set(newRootIds));
     await updatePageTitleIfNeeded(context.pageId, context.pageTitle, parsed.page_title);
 };
 exports.rewritePage = rewritePage;

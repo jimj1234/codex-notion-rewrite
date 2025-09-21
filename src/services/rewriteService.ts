@@ -3,6 +3,7 @@ import { notionClient } from '../clients/notion';
 import { openRouterClient } from '../clients/openrouter';
 import { blockSpecsToNotionBlocks, BlockSpec } from '../utils/blockSpec';
 import { env } from '../config/env';
+import { fetchBlockChildren } from '../utils/notionBlocks';
 
 export interface RewriteContext {
   pageId: string;
@@ -71,8 +72,11 @@ const chunk = <T>(items: T[], size: number): T[][] => {
   return chunks;
 };
 
-const deleteExistingBlocks = async (blockIds: string[]): Promise<void> => {
+const deleteExistingBlocks = async (blockIds: string[], skipIds: Set<string> = new Set()): Promise<void> => {
   for (const id of blockIds) {
+    if (skipIds.has(id)) {
+      continue;
+    }
     await notionClient.blocks.delete({ block_id: id });
   }
 };
@@ -135,7 +139,17 @@ export const rewritePage = async (context: RewriteContext): Promise<void> => {
     throw new Error('LLM returned no blocks; aborting rewrite to avoid wiping the page.');
   }
 
-  await deleteExistingBlocks(context.rootBlockIds);
   await appendBlocks(context.pageId, blockRequests);
+
+  const currentRootBlocks = await fetchBlockChildren(context.pageId);
+  const initialRootIds = new Set(context.rootBlockIds);
+  const currentRootIds = currentRootBlocks.map((block) => block.id);
+  const newRootIds = currentRootIds.filter((id) => !initialRootIds.has(id));
+
+  if (newRootIds.length === 0) {
+    throw new Error('Appended blocks not detected; aborting deletion to preserve page content.');
+  }
+
+  await deleteExistingBlocks(context.rootBlockIds, new Set(newRootIds));
   await updatePageTitleIfNeeded(context.pageId, context.pageTitle, parsed.page_title);
 };
